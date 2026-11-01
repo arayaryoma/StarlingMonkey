@@ -806,10 +806,14 @@ Result<HttpIncomingBody::ReadResult> HttpIncomingBody::read(uint32_t chunk_size)
 Result<Void> HttpIncomingBody::close() { return {}; }
 
 Result<PollableHandle> HttpIncomingBody::subscribe() {
-  auto body_handle = IncomingBodyHandle::cast(handle_state_.get());
-  auto borrow = Borrow<InputStream>(body_handle->stream_handle_);
-  auto pollable = wasi_io_streams_method_input_stream_subscribe(borrow);
-  return Result<PollableHandle>::ok(pollable.__handle);
+  // The pollable is cached so that `unsubscribe` can drop it; previously every call created a
+  // new pollable that was never dropped.
+  auto *body_handle = IncomingBodyHandle::cast(handle_state_.get());
+  if (body_handle->pollable_handle_ == INVALID_POLLABLE_HANDLE) {
+    auto borrow = Borrow<InputStream>(body_handle->stream_handle_);
+    body_handle->pollable_handle_ = wasi_io_streams_method_input_stream_subscribe(borrow).__handle;
+  }
+  return Result<PollableHandle>::ok(body_handle->pollable_handle_);
 }
 void HttpIncomingBody::unsubscribe() {
   auto state = static_cast<IncomingBodyHandle *>(handle_state_.get());
