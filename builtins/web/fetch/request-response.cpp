@@ -134,6 +134,114 @@ public:
   void trace(JSTracer *trc) override { TraceEdge(trc, &body_source_, "body source for future"); }
 };
 
+constexpr size_t BODY_ALL_READ_CHUNK_SIZE = 64 * 1024;
+
+// Consumes an incoming body that was never reified into a ReadableStream by reading it straight
+// into one buffer, so that `text()`, `json()` etc. don't pay for per-chunk JS objects, promise
+// reactions and a final concatenation copy.
+class BodyReadAllTask final : public api::AsyncTask {
+  Heap<JSObject *> owner_;
+  host_api::HttpIncomingBody *incoming_body_;
+  RequestOrResponse::ParseBodyCB *parse_body_;
+  JS::UniqueChars buf_;
+  size_t len_ = 0;
+  size_t capacity_ = 0;
+
+  bool append(JSContext *cx, host_api::HostBytes &bytes) {
+    // Chunks are allocated through `cabi_realloc`, i.e. by the JS allocator, so the first chunk
+    // can be adopted as-is, which makes single-chunk bodies zero-copy.
+    if (!buf_) {
+      buf_.reset(reinterpret_cast<char *>(bytes.ptr.release()));
+      len_ = capacity_ = bytes.len;
+      return true;
+    }
+
+    if (len_ + bytes.len > capacity_) {
+      size_t new_capacity = std::max({len_ + bytes.len, capacity_ * 2, BODY_ALL_READ_CHUNK_SIZE});
+      auto *new_buf = static_cast<char *>(JS_realloc(cx, buf_.get(), capacity_, new_capacity));
+      if (!new_buf) {
+        JS_ReportOutOfMemory(cx);
+        return false;
+      }
+      std::ignore = buf_.release();
+      buf_.reset(new_buf);
+      capacity_ = new_capacity;
+    }
+
+    memcpy(buf_.get() + len_, bytes.ptr.get(), bytes.len);
+    len_ += bytes.len;
+    return true;
+  }
+
+  bool reject_with_pending_error(JSContext *cx, HandleObject owner) {
+    RootedObject promise(cx, RequestOrResponse::take_body_all_promise(owner));
+    return RejectPromiseWithPendingError(cx, promise);
+  }
+
+public:
+  BodyReadAllTask(const HandleObject owner, RequestOrResponse::ParseBodyCB *parse_body)
+      : owner_(owner), incoming_body_(RequestOrResponse::incoming_body_handle(owner)),
+        parse_body_(parse_body) {
+    auto res = incoming_body_->subscribe();
+    MOZ_ASSERT(!res.is_err(), "Subscribing to a stream should never fail");
+    handle_ = res.unwrap();
+  }
+
+  [[nodiscard]] bool run(api::Engine *engine) override {
+    JSContext *cx = engine->cx();
+    RootedObject owner(cx, owner_);
+
+    // `abort_fetch` rejects the promise itself when the body has no stream to error.
+    if (!RequestOrResponse::body_all_promise(owner)) {
+      return cancel(engine);
+    }
+
+    while (true) {
+      auto read_res = incoming_body_->read(BODY_ALL_READ_CHUNK_SIZE);
+      if (read_res.to_err()) {
+        std::ignore = cancel(engine);
+        const auto *receiver = Request::is_instance(owner) ? "request" : "response";
+        api::throw_error(cx, FetchErrors::IncomingBodyStreamError, receiver);
+        return reject_with_pending_error(cx, owner);
+      }
+
+      auto &chunk = read_res.unwrap();
+      if (chunk.done) {
+        std::ignore = cancel(engine);
+        if (capacity_ > len_) {
+          // Shrinking in place is cheap, and the buffer may end up backing a long-lived
+          // ArrayBuffer or Blob.
+          auto *shrunk = static_cast<char *>(JS_realloc(cx, buf_.get(), capacity_, len_));
+          if (shrunk) {
+            std::ignore = buf_.release();
+            buf_.reset(shrunk);
+            capacity_ = len_;
+          }
+        }
+        return parse_body_(cx, owner, std::move(buf_), len_);
+      }
+
+      if (chunk.bytes.len == 0) {
+        engine->queue_async_task(this);
+        return true;
+      }
+
+      if (!append(cx, chunk.bytes)) {
+        std::ignore = cancel(engine);
+        return reject_with_pending_error(cx, owner);
+      }
+    }
+  }
+
+  [[nodiscard]] bool cancel(api::Engine *engine) override {
+    incoming_body_->unsubscribe();
+    handle_ = INVALID_POLLABLE_HANDLE;
+    return true;
+  }
+
+  void trace(JSTracer *trc) override { TraceEdge(trc, &owner_, "body owner for read-all"); }
+};
+
 namespace {
 // https://fetch.spec.whatwg.org/#concept-method-normalize
 // Returns `true` if the method name was normalized, `false` otherwise.
@@ -973,9 +1081,15 @@ bool RequestOrResponse::bodyAll(JSContext *cx, JS::CallArgs args, JS::HandleObje
     return true;
   }
 
+  if (is_incoming(self) && !body_stream(self)) {
+    SetReservedSlot(self, std::to_underlying(Slots::BodyUsed), JS::BooleanValue(true));
+    ENGINE->queue_async_task(js_new<BodyReadAllTask>(self, parse_body<result_type>));
+    args.rval().setObject(*bodyAll_promise);
+    return true;
+  }
+
   JS::RootedValue body_parser(cx, JS::PrivateValue((void *)parse_body<result_type>));
 
-  // TODO(performance): don't reify a ReadableStream for body handles—use an AsyncTask instead
   JS::RootedObject stream(cx, body_stream(self));
   if (!stream) {
     if (!(stream = create_body_stream(cx, self))) {

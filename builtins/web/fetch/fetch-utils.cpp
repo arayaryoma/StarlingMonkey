@@ -229,6 +229,18 @@ bool abort_fetch(JSContext *cx, HandleObject promise, HandleObject request, Hand
     if (body && IsReadableStream(body) && !ReadableStreamError(cx, body, error)) {
       return false;
     }
+
+    // A body being consumed via `text()`, `json()` etc. without a reified stream has no stream to
+    // error, so its pending result promise has to be rejected directly.
+    if (!body) {
+      RootedObject body_all_promise(cx, RequestOrResponse::take_body_all_promise(response));
+      if (body_all_promise) {
+        JS_SetPendingException(cx, error);
+        if (!RejectPromiseWithPendingError(cx, body_all_promise)) {
+          return false;
+        }
+      }
+    }
   }
 
   Response::set_aborted(response, error);
