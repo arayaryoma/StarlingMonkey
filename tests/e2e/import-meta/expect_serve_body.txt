@@ -1,0 +1,3 @@
+entry: object true true
+dep: object true false true
+try: no exception 1

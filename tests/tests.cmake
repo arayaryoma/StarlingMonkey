@@ -64,6 +64,7 @@ test_e2e(init-location)
 test_e2e(finalization-registry)
 test_e2e(finalization-registry-snapshot)
 test_e2e(finalization-registry-tla-err)
+test_e2e(import-meta)
 
 integration_tests(
     blob

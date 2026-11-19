@@ -367,18 +367,19 @@ bool module_metadata_hook(JSContext *cx, HandleValue ref_priv, HandleObject meta
   if (!JS_GetProperty(cx, info, "id", &parent_id_val)) {
     return false;
   }
+  // Returning `false` without a pending exception is an uncatchable error, but evaluating
+  // `import.meta` must never throw. Modules that aren't builtins simply get no extra properties.
   if (!parent_id_val.isString()) {
-    return false;
+    return true;
   }
   RootedValue builtin_val(cx);
   if (!MapGet(cx, builtinModules, parent_id_val, &builtin_val)) {
     return false;
   }
   if (builtin_val.isUndefined()) {
-    return false;
+    return true;
   }
-  JS_SetProperty(cx, meta_obj, "builtin", builtin_val);
-  return true;
+  return JS_SetProperty(cx, meta_obj, "builtin", builtin_val);
 }
 
 ScriptLoader::ScriptLoader(api::Engine *engine, JS::CompileOptions *opts,
